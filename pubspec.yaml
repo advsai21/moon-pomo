@@ -1,19 +1,30 @@
 name: moonpomo
 description: Cute moon tamagotchi + pomodoro planner.
 publish_to: 'none'
-version: 1.0.0+1
+version: 2.0.0+2
 
 environment:
-  sdk: '>=3.4.0 <4.0.0'
+  sdk: '>=3.8.0 <4.0.0'
 
 dependencies:
   flutter:
     sdk: flutter
   shared_preferences: ^2.3.0
+  flutter_local_notifications: ^21.0.0
+  timezone: ^0.10.0
+  flutter_overlay_window: ^1.0.2
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  flutter_launcher_icons: ^0.14.4
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: assets/icon.png
+  adaptive_icon_background: "#1C1B4B"
+  adaptive_icon_foreground: assets/icon_fg.png
 
 flutter:
   uses-material-design: true

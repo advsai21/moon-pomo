@@ -1,12 +1,16 @@
-// MoonPomo — a cute moon tamagotchi that lives in your pomodoro planner.
-// Single file. Needs: shared_preferences. Flutter 3.22+ / Dart 3.4+.
+// MoonPomo 2 — cute moon tamagotchi + pomodoro planner.
+// Floating moon over other apps, notifications, closet, stats. Single file.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:timezone/data/latest.dart' as tzdata;
+import 'package:timezone/timezone.dart' as tz;
 
 // ───────────────────────── palette ─────────────────────────
 const kBg0 = Color(0xFF0A0E2A);
@@ -18,6 +22,24 @@ const kLilac = Color(0xFFB9A6FF);
 const kMint = Color(0xFF8FE3CF);
 const kInk = Color(0xFF3B2F5C);
 
+class Skin {
+  const Skin(this.name, this.cost, this.hi, this.mid, this.lo);
+  final String name;
+  final int cost;
+  final Color hi, mid, lo;
+}
+
+const skins = [
+  Skin('Golden', 0, Color(0xFFFFF8DC), Color(0xFFFFE08A), Color(0xFFF5C25B)),
+  Skin('Rose', 30, Color(0xFFFFF0F5), Color(0xFFFFC2D9), Color(0xFFF59AB8)),
+  Skin('Blue', 30, Color(0xFFF0F6FF), Color(0xFFBFD7FF), Color(0xFF8FB2F0)),
+  Skin('Mint', 50, Color(0xFFF2FFF9), Color(0xFFBFF2DE), Color(0xFF8FD6BC)),
+];
+const accNames = ['None', 'Bow', 'Nightcap', 'Glasses', 'Crown'];
+const accCosts = [0, 20, 30, 25, 60];
+const accEmoji = ['✨', '🎀', '🛏️', '👓', '👑'];
+
+// ───────────────────────── entry points ─────────────────────────
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
@@ -26,9 +48,168 @@ Future<void> main() async {
     statusBarIconBrightness: Brightness.light,
     systemNavigationBarIconBrightness: Brightness.light,
   ));
+  await Notifs.init();
   final state = AppState();
   await state.load();
   runApp(MoonApp(state));
+}
+
+/// Entry point for the floating bubble that is drawn over other apps.
+@pragma('vm:entry-point')
+void overlayMain() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const MaterialApp(
+    debugShowCheckedModeBanner: false,
+    home: Material(color: Colors.transparent, child: OverlayBubble()),
+  ));
+}
+
+// ───────────────────────── notifications ─────────────────────────
+class Notifs {
+  static final _np = FlutterLocalNotificationsPlugin();
+  static bool _ready = false;
+
+  static Future<void> init() async {
+    try {
+      tzdata.initializeTimeZones();
+      await _np.initialize(
+        settings: const InitializationSettings(
+          android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+        ),
+      );
+      _ready = true;
+    } catch (_) {}
+  }
+
+  static AndroidFlutterLocalNotificationsPlugin? get _android => _np
+      .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin>();
+
+  static Future<bool> askPermission() async {
+    try {
+      return await _android?.requestNotificationsPermission() ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<AndroidScheduleMode> _mode() async {
+    try {
+      final ok = await _android?.canScheduleExactNotifications() ?? false;
+      return ok
+          ? AndroidScheduleMode.exactAllowWhileIdle
+          : AndroidScheduleMode.inexactAllowWhileIdle;
+    } catch (_) {
+      return AndroidScheduleMode.inexactAllowWhileIdle;
+    }
+  }
+
+  static tz.TZDateTime _at(int ms) =>
+      tz.TZDateTime.fromMillisecondsSinceEpoch(tz.UTC, ms);
+
+  /// Ongoing countdown notification + a scheduled alert for when it ends.
+  static Future<void> timerStarted(int endAt, Phase p, String? task) async {
+    if (!_ready) return;
+    try {
+      final focus = p == Phase.focus;
+      await _np.show(
+        id: 1,
+        title: focus ? 'Focusing 🌙' : 'Break time 💤',
+        body: focus ? (task ?? 'Luna is cheering you on ✨') : 'Rest your eyes ✨',
+        notificationDetails: NotificationDetails(
+          android: AndroidNotificationDetails(
+            'moonpomo_timer',
+            'Running timer',
+            channelDescription: 'Shows the countdown while a session runs',
+            importance: Importance.low,
+            priority: Priority.low,
+            ongoing: true,
+            autoCancel: false,
+            onlyAlertOnce: true,
+            showWhen: true,
+            when: endAt,
+            usesChronometer: true,
+            chronometerCountDown: true,
+            playSound: false,
+            enableVibration: false,
+          ),
+        ),
+      );
+      await _np.zonedSchedule(
+        id: 2,
+        title: focus ? 'Session complete! 🍅' : 'Break over ☀️',
+        body: focus
+            ? 'Nice focus — Luna is proud of you. Time for a break.'
+            : 'Ready for another focus session?',
+        scheduledDate: _at(endAt),
+        notificationDetails: const NotificationDetails(
+          android: AndroidNotificationDetails(
+            'moonpomo_alerts',
+            'Session alerts',
+            channelDescription: 'Tells you when a session or break ends',
+            importance: Importance.high,
+            priority: Priority.high,
+          ),
+        ),
+        androidScheduleMode: await _mode(),
+      );
+    } catch (_) {}
+  }
+
+  static Future<void> cancelTimer() async {
+    if (!_ready) return;
+    try {
+      await _np.cancel(id: 1);
+      await _np.cancel(id: 2);
+    } catch (_) {}
+  }
+
+  static Future<void> cancelOngoing() async {
+    if (!_ready) return;
+    try {
+      await _np.cancel(id: 1);
+    } catch (_) {}
+  }
+
+  static Future<void> cancelAll() async {
+    if (!_ready) return;
+    try {
+      await _np.cancel(id: 1);
+      await _np.cancel(id: 2);
+      await _np.cancel(id: 3);
+    } catch (_) {}
+  }
+
+  /// "Luna is hungry" reminder, kept out of the night hours.
+  static Future<void> scheduleHungry(int? atMs, String name) async {
+    if (!_ready) return;
+    try {
+      await _np.cancel(id: 3);
+      if (atMs == null) return;
+      var d = DateTime.fromMillisecondsSinceEpoch(atMs);
+      if (d.hour >= 22 || d.hour < 8) {
+        final base = d.hour >= 22 ? d.add(const Duration(days: 1)) : d;
+        d = DateTime(base.year, base.month, base.day, 8);
+      }
+      if (d.millisecondsSinceEpoch < _now() + 60000) return;
+      await _np.zonedSchedule(
+        id: 3,
+        title: '$name is hungry 🍬',
+        body: 'Spend some stardust on a snack, or do a focus session to earn more.',
+        scheduledDate: _at(d.millisecondsSinceEpoch),
+        notificationDetails: const NotificationDetails(
+          android: AndroidNotificationDetails(
+            'moonpomo_pet',
+            'Moon care',
+            channelDescription: 'Reminders when your moon needs a snack',
+            importance: Importance.defaultImportance,
+            priority: Priority.defaultPriority,
+          ),
+        ),
+        androidScheduleMode: await _mode(),
+      );
+    } catch (_) {}
+  }
 }
 
 // ───────────────────────── state ─────────────────────────
@@ -37,56 +218,84 @@ enum Phase { focus, short, long }
 enum Mood { happy, focus, sleepy, sad, love }
 
 class Task {
-  Task(this.id, this.title, {this.done = false, this.pomos = 0});
+  Task(this.id, this.title, {this.done = false, this.pomos = 0, this.est = 2});
   final String id;
   String title;
   bool done;
-  int pomos;
+  int pomos, est;
   Map<String, dynamic> toJson() =>
-      {'id': id, 'title': title, 'done': done, 'pomos': pomos};
+      {'id': id, 'title': title, 'done': done, 'pomos': pomos, 'est': est};
   factory Task.fromJson(Map<String, dynamic> j) => Task(
         j['id'] as String,
         j['title'] as String,
         done: j['done'] as bool? ?? false,
         pomos: j['pomos'] as int? ?? 0,
+        est: j['est'] as int? ?? 2,
       );
 }
 
-String _today() {
-  final d = DateTime.now();
-  return '${d.year}-${d.month}-${d.day}';
-}
-
+String _key(DateTime d) =>
+    '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+String _today() => _key(DateTime.now());
 int _now() => DateTime.now().millisecondsSinceEpoch;
 
 class AppState extends ChangeNotifier {
   SharedPreferences? _p;
   final List<Task> tasks = [];
-  int stardust = 10, xp = 0, pomosToday = 0, cycle = 0;
+  int stardust = 10, xp = 0, cycle = 0, totalPomos = 0, totalMin = 0;
+  final Map<String, int> history = {};
   double _fullness = 0.7;
   int _fedAt = _now();
-  String day = _today();
   String? activeId;
   String petName = 'Luna';
+  int skin = 0, acc = 0;
+  Set<int> ownedSkins = {0}, ownedAcc = {0};
 
+  // settings
+  int focusMin = 25, shortMin = 5, longMin = 15, longEvery = 4;
+  bool autoStart = false, vibrate = true, overlayOn = false, notify = true;
+
+  // timer
   Phase phase = Phase.focus;
   bool running = false;
   int _endAt = 0;
-  int remaining = AppState.dur(Phase.focus);
+  int remaining = 25 * 60;
   Timer? _t;
   int _lastLeft = -1;
   String? event; // one-shot toast message
+  bool overlayShown = false;
+  StreamSubscription<dynamic>? _ovSub;
 
-  static int dur(Phase p) =>
-      (p == Phase.focus ? 25 : (p == Phase.short ? 5 : 15)) * 60;
+  int dur(Phase p) =>
+      (p == Phase.focus ? focusMin : (p == Phase.short ? shortMin : longMin)) * 60;
 
   int get left =>
       running ? math.max(0, ((_endAt - _now()) / 1000).ceil()) : remaining;
   double get progress => 1 - left / dur(phase);
   int get level => xp ~/ 50 + 1;
   double get levelProgress => (xp % 50) / 50;
+  int get pomosToday => history[_today()] ?? 0;
   double get fullness =>
       (_fullness - (_now() - _fedAt) / 3600000 * 0.05).clamp(0.0, 1.0);
+
+  int get streak {
+    var d = DateTime.now();
+    if ((history[_key(d)] ?? 0) == 0) d = d.subtract(const Duration(days: 1));
+    var n = 0;
+    while ((history[_key(d)] ?? 0) > 0) {
+      n++;
+      d = d.subtract(const Duration(days: 1));
+    }
+    return n;
+  }
+
+  List<int> get last7 {
+    final now = DateTime.now();
+    return [
+      for (int i = 6; i >= 0; i--)
+        history[_key(now.subtract(Duration(days: i)))] ?? 0
+    ];
+  }
 
   Task? get activeTask {
     for (final t in tasks) {
@@ -103,17 +312,21 @@ class AppState extends ChangeNotifier {
   }
 
   String get speech {
-    if (running && phase == Phase.focus) return "Shh… we're focusing ✨";
-    if (running) return 'Ahh, cozy break~ 💤';
+    final i = DateTime.now().minute ~/ 2;
+    String pick(List<String> l) => l[i % l.length];
+    if (running && phase == Phase.focus) {
+      return pick(["Shh… we're focusing ✨", 'You got this! 💪', 'One tiny step at a time 🌱', "I'm guarding the stars for you ⭐"]);
+    }
+    if (running) return pick(['Ahh, cozy break~ 💤', 'Stretch your arms! 🙆', 'Sip some water 💧']);
     if (fullness < 0.25) return 'Tummy rumbly… star candy? 🍬';
     if (phase != Phase.focus) return 'Break time! Press play to rest.';
-    return "Ready when you are! 🌙";
+    return pick(['Ready when you are! 🌙', "Let's make tonight count ✨", 'Pick a task and tap play 🍅']);
   }
 
   // ── persistence
   Future<void> load() async {
     _p = await SharedPreferences.getInstance();
-    final raw = _p!.getString('s');
+    final raw = _p!.getString('s2');
     if (raw != null) {
       try {
         final m = jsonDecode(raw) as Map<String, dynamic>;
@@ -123,35 +336,80 @@ class AppState extends ChangeNotifier {
               .map((e) => Task.fromJson(Map<String, dynamic>.from(e as Map))));
         stardust = m['stardust'] as int? ?? stardust;
         xp = m['xp'] as int? ?? 0;
-        pomosToday = m['pomosToday'] as int? ?? 0;
         cycle = m['cycle'] as int? ?? 0;
+        totalPomos = m['totalPomos'] as int? ?? 0;
+        totalMin = m['totalMin'] as int? ?? 0;
+        history
+          ..clear()
+          ..addAll((m['history'] as Map? ?? {})
+              .map((k, v) => MapEntry(k as String, v as int)));
         _fullness = (m['fullness'] as num? ?? 0.7).toDouble();
         _fedAt = m['fedAt'] as int? ?? _now();
-        day = m['day'] as String? ?? _today();
         activeId = m['activeId'] as String?;
         petName = m['petName'] as String? ?? 'Luna';
+        skin = m['skin'] as int? ?? 0;
+        acc = m['acc'] as int? ?? 0;
+        ownedSkins = Set<int>.from((m['ownedSkins'] as List? ?? [0]).cast<int>());
+        ownedAcc = Set<int>.from((m['ownedAcc'] as List? ?? [0]).cast<int>());
+        focusMin = m['focusMin'] as int? ?? 25;
+        shortMin = m['shortMin'] as int? ?? 5;
+        longMin = m['longMin'] as int? ?? 15;
+        longEvery = m['longEvery'] as int? ?? 4;
+        autoStart = m['autoStart'] as bool? ?? false;
+        vibrate = m['vibrate'] as bool? ?? true;
+        overlayOn = m['overlayOn'] as bool? ?? false;
+        notify = m['notify'] as bool? ?? true;
+        phase = Phase.values[(m['phase'] as int? ?? 0).clamp(0, 2)];
+        remaining = m['remaining'] as int? ?? dur(phase);
+        running = m['running'] as bool? ?? false;
+        _endAt = m['endAt'] as int? ?? 0;
       } catch (_) {}
+    } else {
+      remaining = dur(phase);
     }
-    if (day != _today()) {
-      day = _today();
-      pomosToday = 0;
+    if (running) {
+      if (_endAt <= _now()) {
+        _finish(); // finished while the app was closed
+      } else {
+        _startTicker();
+      }
     }
+    _planHungry();
   }
 
   void _save() {
+    final cutoff = _key(DateTime.now().subtract(const Duration(days: 60)));
+    history.removeWhere((k, _) => k.compareTo(cutoff) < 0);
     _p?.setString(
-        's',
+        's2',
         jsonEncode({
           'tasks': tasks.map((t) => t.toJson()).toList(),
           'stardust': stardust,
           'xp': xp,
-          'pomosToday': pomosToday,
           'cycle': cycle,
+          'totalPomos': totalPomos,
+          'totalMin': totalMin,
+          'history': history,
           'fullness': _fullness,
           'fedAt': _fedAt,
-          'day': day,
           'activeId': activeId,
           'petName': petName,
+          'skin': skin,
+          'acc': acc,
+          'ownedSkins': ownedSkins.toList(),
+          'ownedAcc': ownedAcc.toList(),
+          'focusMin': focusMin,
+          'shortMin': shortMin,
+          'longMin': longMin,
+          'longEvery': longEvery,
+          'autoStart': autoStart,
+          'vibrate': vibrate,
+          'overlayOn': overlayOn,
+          'notify': notify,
+          'phase': phase.index,
+          'remaining': remaining,
+          'running': running,
+          'endAt': _endAt,
         }));
   }
 
@@ -160,7 +418,14 @@ class AppState extends ChangeNotifier {
     if (running) return;
     phase = p;
     remaining = dur(p);
+    _save();
     notifyListeners();
+  }
+
+  void _startTicker() {
+    _t?.cancel();
+    _lastLeft = -1;
+    _t = Timer.periodic(const Duration(milliseconds: 250), (_) => _tick());
   }
 
   void toggle() {
@@ -169,12 +434,14 @@ class AppState extends ChangeNotifier {
       remaining = left;
       running = false;
       _t?.cancel();
+      Notifs.cancelTimer();
     } else {
       running = true;
       _endAt = _now() + remaining * 1000;
-      _lastLeft = -1;
-      _t = Timer.periodic(const Duration(milliseconds: 250), (_) => _tick());
+      _startTicker();
+      if (notify) Notifs.timerStarted(_endAt, phase, activeTask?.title);
     }
+    _save();
     notifyListeners();
   }
 
@@ -182,13 +449,17 @@ class AppState extends ChangeNotifier {
     _t?.cancel();
     running = false;
     remaining = dur(phase);
+    Notifs.cancelTimer();
+    _save();
     notifyListeners();
   }
 
   void skip() {
     _t?.cancel();
     running = false;
+    Notifs.cancelTimer();
     _advance();
+    _save();
     notifyListeners();
   }
 
@@ -202,20 +473,28 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Future<void> _buzz() async {
+    if (!vibrate) return;
+    for (var i = 0; i < 3; i++) {
+      await HapticFeedback.heavyImpact();
+      await Future<void>.delayed(const Duration(milliseconds: 260));
+    }
+  }
+
   void _finish() {
     _t?.cancel();
     running = false;
-    HapticFeedback.heavyImpact();
+    Notifs.cancelOngoing();
+    _buzz();
     if (phase == Phase.focus) {
       _snapFullness();
       final before = level;
       xp += 10;
       stardust += 5;
-      if (day != _today()) {
-        day = _today();
-        pomosToday = 0;
-      }
-      pomosToday++;
+      final k = _today();
+      history[k] = (history[k] ?? 0) + 1;
+      totalPomos++;
+      totalMin += focusMin;
       activeTask?.pomos++;
       event = level > before
           ? '🌙 Level up! $petName is now Lv $level'
@@ -224,24 +503,160 @@ class AppState extends ChangeNotifier {
       event = 'Break over — ready to focus?';
     }
     _advance();
+    _planHungry();
     _save();
     notifyListeners();
+    if (autoStart) toggle();
   }
 
   void _advance() {
     if (phase == Phase.focus) {
       cycle++;
-      phase = cycle % 4 == 0 ? Phase.long : Phase.short;
+      phase = cycle % longEvery == 0 ? Phase.long : Phase.short;
     } else {
       phase = Phase.focus;
     }
     remaining = dur(phase);
   }
 
+  /// Called when the app comes back to the foreground.
+  void onResume() {
+    closeBubble();
+    if (running) {
+      if (left <= 0) {
+        _finish();
+      } else {
+        _startTicker();
+      }
+    }
+    _planHungry();
+    notifyListeners();
+  }
+
+  // ── settings
+  void setDurations({int? f, int? s, int? l, int? every}) {
+    focusMin = f ?? focusMin;
+    shortMin = s ?? shortMin;
+    longMin = l ?? longMin;
+    longEvery = every ?? longEvery;
+    if (!running) remaining = dur(phase);
+    _save();
+    notifyListeners();
+  }
+
+  void setFlags({bool? auto, bool? vib}) {
+    autoStart = auto ?? autoStart;
+    vibrate = vib ?? vibrate;
+    _save();
+    notifyListeners();
+  }
+
+  Future<void> setNotify(bool v) async {
+    if (v) {
+      await Notifs.askPermission();
+      notify = true;
+      _planHungry();
+    } else {
+      notify = false;
+      await Notifs.cancelAll();
+    }
+    _save();
+    notifyListeners();
+  }
+
+  Future<bool> setOverlay(bool v) async {
+    if (!v) {
+      overlayOn = false;
+      await closeBubble();
+      _save();
+      notifyListeners();
+      return true;
+    }
+    try {
+      var granted = await FlutterOverlayWindow.isPermissionGranted();
+      if (!granted) {
+        granted = (await FlutterOverlayWindow.requestPermission()) ?? false;
+      }
+      overlayOn = granted;
+    } catch (_) {
+      overlayOn = false;
+    }
+    _save();
+    notifyListeners();
+    return overlayOn;
+  }
+
+  // ── floating bubble
+  void attachOverlayListener() {
+    try {
+      _ovSub = FlutterOverlayWindow.overlayListener.listen((dynamic e) {
+        if (e == 'toggle') toggle();
+      });
+    } catch (_) {}
+  }
+
+  Future<void> showBubble() async {
+    if (!overlayOn || overlayShown) return;
+    try {
+      if (!await FlutterOverlayWindow.isPermissionGranted()) return;
+      await FlutterOverlayWindow.showOverlay(
+        height: 190,
+        width: 140,
+        alignment: OverlayAlignment.centerRight,
+        enableDrag: true,
+        flag: OverlayFlag.defaultFlag,
+        positionGravity: PositionGravity.auto,
+        overlayTitle: 'MoonPomo',
+        overlayContent: '$petName is floating nearby',
+      );
+      overlayShown = true;
+      Future<void>.delayed(const Duration(milliseconds: 600), _push);
+    } catch (_) {}
+  }
+
+  Future<void> closeBubble() async {
+    if (!overlayShown) return;
+    overlayShown = false;
+    try {
+      await FlutterOverlayWindow.closeOverlay();
+    } catch (_) {}
+  }
+
+  void _push() {
+    if (!overlayShown) return;
+    final m = {
+      'mood': mood.index,
+      'left': left,
+      'running': running,
+      'phase': phase.index,
+      'level': level,
+      'skin': skin,
+      'acc': acc,
+    };
+    () async {
+      try {
+        await FlutterOverlayWindow.shareData(m);
+      } catch (_) {}
+    }();
+  }
+
+  @override
+  void notifyListeners() {
+    super.notifyListeners();
+    _push();
+  }
+
   // ── pet
   void _snapFullness() {
     _fullness = fullness;
     _fedAt = _now();
+  }
+
+  void _planHungry() {
+    if (!notify) return;
+    final hours = (fullness - 0.25) / 0.05;
+    Notifs.scheduleHungry(
+        hours > 0 ? _now() + (hours * 3600000).round() : null, petName);
   }
 
   bool feed(int cost, double amount) {
@@ -251,6 +666,7 @@ class AppState extends ChangeNotifier {
     stardust -= cost;
     xp += 2;
     HapticFeedback.lightImpact();
+    _planHungry();
     _save();
     notifyListeners();
     return true;
@@ -263,10 +679,45 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// returns 'equipped', 'bought' or 'poor'
+  String pickSkin(int i) {
+    if (!ownedSkins.contains(i)) {
+      if (stardust < skins[i].cost) return 'poor';
+      stardust -= skins[i].cost;
+      ownedSkins.add(i);
+      skin = i;
+      _afterShop();
+      return 'bought';
+    }
+    skin = i;
+    _afterShop();
+    return 'equipped';
+  }
+
+  String pickAcc(int i) {
+    if (!ownedAcc.contains(i)) {
+      if (stardust < accCosts[i]) return 'poor';
+      stardust -= accCosts[i];
+      ownedAcc.add(i);
+      acc = i;
+      _afterShop();
+      return 'bought';
+    }
+    acc = i;
+    _afterShop();
+    return 'equipped';
+  }
+
+  void _afterShop() {
+    HapticFeedback.selectionClick();
+    _save();
+    notifyListeners();
+  }
+
   // ── tasks
-  void addTask(String title) {
+  void addTask(String title, int est) {
     if (title.trim().isEmpty) return;
-    final t = Task(DateTime.now().microsecondsSinceEpoch.toString(), title.trim());
+    final t = Task(DateTime.now().microsecondsSinceEpoch.toString(), title.trim(), est: est);
     tasks.add(t);
     activeId ??= t.id;
     _save();
@@ -298,9 +749,16 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  void clearDone() {
+    tasks.removeWhere((e) => e.done);
+    _save();
+    notifyListeners();
+  }
+
   @override
   void dispose() {
     _t?.cancel();
+    _ovSub?.cancel();
     super.dispose();
   }
 }
@@ -334,33 +792,41 @@ class HomeShell extends StatefulWidget {
   State<HomeShell> createState() => _HomeShellState();
 }
 
-class _HomeShellState extends State<HomeShell> {
+class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int _tab = 0;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     widget.s.addListener(_onState);
+    widget.s.attachOverlayListener();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _onState());
+    // ask for notification permission once, softly
+    Notifs.askPermission();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     widget.s.removeListener(_onState);
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState st) {
+    if (st == AppLifecycleState.resumed) {
+      widget.s.onResume();
+    } else if (st == AppLifecycleState.paused) {
+      widget.s.showBubble();
+    }
+  }
+
   void _onState() {
     final e = widget.s.event;
-    if (e == null) return;
+    if (e == null || !mounted) return;
     widget.s.event = null;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(
-        content: Text(e, style: const TextStyle(fontWeight: FontWeight.w600)),
-        behavior: SnackBarBehavior.floating,
-        backgroundColor: const Color(0xFF2B2670),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      ));
+    toast(context, e);
   }
 
   @override
@@ -401,6 +867,17 @@ class _HomeShellState extends State<HomeShell> {
   }
 }
 
+void toast(BuildContext context, String msg) {
+  ScaffoldMessenger.of(context)
+    ..hideCurrentSnackBar()
+    ..showSnackBar(SnackBar(
+      content: Text(msg, style: const TextStyle(fontWeight: FontWeight.w600)),
+      behavior: SnackBarBehavior.floating,
+      backgroundColor: const Color(0xFF2B2670),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+    ));
+}
+
 // ───────────────────────── focus tab ─────────────────────────
 class FocusTab extends StatelessWidget {
   const FocusTab(this.s, {super.key, required this.onPlan});
@@ -417,97 +894,100 @@ class FocusTab extends StatelessWidget {
       builder: (context, _) {
         final brk = s.phase != Phase.focus;
         return SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
-          child: Column(children: [
-            Row(children: [
-              Pill('🌙', 'Lv ${s.level}'),
-              const SizedBox(width: 8),
-              Pill('✨', '${s.stardust}'),
-              const Spacer(),
-              Pill('🍅', '${s.pomosToday} today'),
-            ]),
-            const SizedBox(height: 18),
-            _PhaseSelector(s),
-            const SizedBox(height: 10),
-            SizedBox(
-              width: 300,
-              height: 320,
-              child: Stack(alignment: Alignment.center, children: [
-                Positioned.fill(
-                    child: CustomPaint(
-                        painter: RingPainter(s.progress, brk))),
-                Align(
-                  alignment: const Alignment(0, -0.22),
-                  child: MoonPet(mood: s.mood, level: s.level, size: 210),
-                ),
-                Align(
-                  alignment: const Alignment(0, 0.66),
-                  child: Text(_fmt(s.left),
-                      style: const TextStyle(
-                        fontSize: 46,
-                        fontWeight: FontWeight.w300,
-                        letterSpacing: 2,
-                        fontFeatures: [FontFeature.tabularFigures()],
-                      )),
+          padding: const EdgeInsets.fromLTRB(20, 8, 12, 24),
+          child: Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: Column(children: [
+              Row(children: [
+                Pill('🌙', 'Lv ${s.level}'),
+                const SizedBox(width: 8),
+                Pill('✨', '${s.stardust}'),
+                const SizedBox(width: 8),
+                Pill('🍅', '${s.pomosToday}'),
+                const Spacer(),
+                IconButton(
+                  tooltip: 'Settings',
+                  onPressed: () => showSettings(context, s),
+                  icon: const Icon(Icons.tune_rounded),
                 ),
               ]),
-            ),
-            const SizedBox(height: 4),
-            Glass(
-              radius: 20,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-              child: Text(s.speech,
-                  style: const TextStyle(fontSize: 15, color: Colors.white70)),
-            ),
-            const SizedBox(height: 14),
-            GestureDetector(
-              onTap: onPlan,
-              child: Pill(
-                  '🎯',
-                  s.activeTask == null
-                      ? 'Pick a task in Plan'
-                      : s.activeTask!.title),
-            ),
-            const SizedBox(height: 22),
-            Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-              IconButton(
-                  iconSize: 30,
-                  onPressed: s.reset,
-                  icon: const Icon(Icons.restart_alt_rounded)),
-              const SizedBox(width: 22),
-              GestureDetector(
-                onTap: s.toggle,
-                child: Container(
-                  width: 82,
-                  height: 82,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: const LinearGradient(
-                        colors: [kGold, kPink],
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight),
-                    boxShadow: [
-                      BoxShadow(
-                          color: kPink.withAlpha(90),
-                          blurRadius: 24,
-                          spreadRadius: 1)
-                    ],
+              const SizedBox(height: 8),
+              _PhaseSelector(s),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: 300,
+                height: 320,
+                child: Stack(alignment: Alignment.center, children: [
+                  Positioned.fill(
+                      child: CustomPaint(painter: RingPainter(s.progress, brk))),
+                  Align(
+                    alignment: const Alignment(0, -0.22),
+                    child: MoonPet(
+                        mood: s.mood, level: s.level, skin: s.skin, acc: s.acc, size: 210),
                   ),
-                  child: Icon(
-                      s.running
-                          ? Icons.pause_rounded
-                          : Icons.play_arrow_rounded,
-                      size: 46,
-                      color: kInk),
-                ),
+                  Align(
+                    alignment: const Alignment(0, 0.66),
+                    child: Text(_fmt(s.left),
+                        style: const TextStyle(
+                          fontSize: 46,
+                          fontWeight: FontWeight.w300,
+                          letterSpacing: 2,
+                          fontFeatures: [FontFeature.tabularFigures()],
+                        )),
+                  ),
+                ]),
               ),
-              const SizedBox(width: 22),
-              IconButton(
-                  iconSize: 30,
-                  onPressed: s.skip,
-                  icon: const Icon(Icons.skip_next_rounded)),
+              const SizedBox(height: 4),
+              Glass(
+                radius: 20,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                child: Text(s.speech,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontSize: 15, color: Colors.white70)),
+              ),
+              const SizedBox(height: 14),
+              GestureDetector(
+                onTap: onPlan,
+                child: Pill('🎯',
+                    s.activeTask == null ? 'Pick a task in Plan' : s.activeTask!.title),
+              ),
+              const SizedBox(height: 22),
+              Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                IconButton(
+                    iconSize: 30,
+                    onPressed: s.reset,
+                    icon: const Icon(Icons.restart_alt_rounded)),
+                const SizedBox(width: 22),
+                GestureDetector(
+                  onTap: s.toggle,
+                  child: Container(
+                    width: 82,
+                    height: 82,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: const LinearGradient(
+                          colors: [kGold, kPink],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight),
+                      boxShadow: [
+                        BoxShadow(
+                            color: kPink.withAlpha(90), blurRadius: 24, spreadRadius: 1)
+                      ],
+                    ),
+                    child: Icon(
+                        s.running ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                        size: 46,
+                        color: kInk),
+                  ),
+                ),
+                const SizedBox(width: 22),
+                IconButton(
+                    iconSize: 30,
+                    onPressed: s.skip,
+                    icon: const Icon(Icons.skip_next_rounded)),
+              ]),
             ]),
-          ]),
+          ),
         );
       },
     );
@@ -519,11 +999,7 @@ class _PhaseSelector extends StatelessWidget {
   final AppState s;
   @override
   Widget build(BuildContext context) {
-    const labels = {
-      Phase.focus: 'Focus',
-      Phase.short: 'Short',
-      Phase.long: 'Long'
-    };
+    const labels = {Phase.focus: 'Focus', Phase.short: 'Short', Phase.long: 'Long'};
     return Glass(
       radius: 30,
       padding: const EdgeInsets.all(4),
@@ -549,6 +1025,97 @@ class _PhaseSelector extends StatelessWidget {
   }
 }
 
+// ───────────────────────── settings ─────────────────────────
+void showSettings(BuildContext context, AppState s) {
+  showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: const Color(0xFF1B1950),
+    shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
+    builder: (_) => SettingsSheet(s),
+  );
+}
+
+class SettingsSheet extends StatelessWidget {
+  const SettingsSheet(this.s, {super.key});
+  final AppState s;
+
+  Widget _slider(String label, int v, int min, int max, int step, void Function(int) on) {
+    return Column(children: [
+      Row(children: [
+        Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
+        const Spacer(),
+        Text('$v', style: const TextStyle(color: kGold, fontWeight: FontWeight.w700)),
+      ]),
+      Slider(
+        value: v.toDouble(),
+        min: min.toDouble(),
+        max: max.toDouble(),
+        divisions: (max - min) ~/ step,
+        onChanged: (x) => on(x.round()),
+      ),
+    ]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: s,
+      builder: (context, _) => SingleChildScrollView(
+        padding: EdgeInsets.fromLTRB(22, 14, 22, 22 + MediaQuery.of(context).viewInsets.bottom),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Center(
+            child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                    color: Colors.white24, borderRadius: BorderRadius.circular(4))),
+          ),
+          const SizedBox(height: 14),
+          const Text('Settings', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w700)),
+          const SizedBox(height: 10),
+          _slider('Focus (min)', s.focusMin, 5, 60, 5, (v) => s.setDurations(f: v)),
+          _slider('Short break (min)', s.shortMin, 1, 15, 1, (v) => s.setDurations(s: v)),
+          _slider('Long break (min)', s.longMin, 5, 30, 5, (v) => s.setDurations(l: v)),
+          _slider('Long break every N sessions', s.longEvery, 2, 8, 1, (v) => s.setDurations(every: v)),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Auto-start next session'),
+            value: s.autoStart,
+            onChanged: (v) => s.setFlags(auto: v),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Vibrate when a session ends'),
+            value: s.vibrate,
+            onChanged: (v) => s.setFlags(vib: v),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Notifications'),
+            subtitle: const Text('Live countdown, session alerts, hungry moon'),
+            value: s.notify,
+            onChanged: (v) => s.setNotify(v),
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Floating moon over other apps'),
+            subtitle: const Text('Shows when you leave the app. Tap the time to pause/resume.'),
+            value: s.overlayOn,
+            onChanged: (v) async {
+              final ok = await s.setOverlay(v);
+              if (v && !ok && context.mounted) {
+                toast(context, 'Allow "Display over other apps" for MoonPomo, then switch this on again.');
+              }
+            },
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
 // ───────────────────────── plan tab ─────────────────────────
 class PlanTab extends StatefulWidget {
   const PlanTab(this.s, {super.key});
@@ -559,9 +1126,10 @@ class PlanTab extends StatefulWidget {
 
 class _PlanTabState extends State<PlanTab> {
   final _c = TextEditingController();
+  int _est = 2;
 
   void _add() {
-    widget.s.addTask(_c.text);
+    widget.s.addTask(_c.text, _est);
     _c.clear();
   }
 
@@ -577,14 +1145,25 @@ class _PlanTabState extends State<PlanTab> {
     return ListenableBuilder(
       listenable: s,
       builder: (context, _) {
+        final list = [
+          ...s.tasks.where((t) => !t.done),
+          ...s.tasks.where((t) => t.done),
+        ];
+        final doneCount = s.tasks.where((t) => t.done).length;
         return Padding(
           padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text("Tonight's plan",
-                style: TextStyle(fontSize: 28, fontWeight: FontWeight.w700)),
+            Row(children: [
+              const Expanded(
+                child: Text("Tonight's plan",
+                    style: TextStyle(fontSize: 28, fontWeight: FontWeight.w700)),
+              ),
+              if (doneCount > 0)
+                TextButton(onPressed: s.clearDone, child: const Text('Clear done')),
+            ]),
             const SizedBox(height: 4),
-            const Text('Tap 🎯 to feed a task to your pomodoros. Swipe to delete.',
-                style: TextStyle(color: Colors.white54)),
+            Text('${s.tasks.length - doneCount} to go  ·  tap 🎯 to focus on a task  ·  swipe to delete',
+                style: const TextStyle(color: Colors.white54)),
             const SizedBox(height: 16),
             Glass(
               radius: 22,
@@ -596,30 +1175,42 @@ class _PlanTabState extends State<PlanTab> {
                     onSubmitted: (_) => _add(),
                     textInputAction: TextInputAction.done,
                     decoration: const InputDecoration(
-                        hintText: 'Add a wish for tonight…',
-                        border: InputBorder.none),
+                        hintText: 'Add a wish for tonight…', border: InputBorder.none),
                   ),
                 ),
                 IconButton.filled(
-                  style: IconButton.styleFrom(
-                      backgroundColor: kLilac, foregroundColor: kInk),
+                  style: IconButton.styleFrom(backgroundColor: kLilac, foregroundColor: kInk),
                   onPressed: _add,
                   icon: const Icon(Icons.add_rounded),
                 ),
               ]),
             ),
-            const SizedBox(height: 14),
+            const SizedBox(height: 8),
+            Row(children: [
+              const Text('Estimate', style: TextStyle(color: Colors.white54)),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                onPressed: _est > 1 ? () => setState(() => _est--) : null,
+                icon: const Icon(Icons.remove_circle_outline_rounded),
+              ),
+              Text('🍅 × $_est', style: const TextStyle(fontWeight: FontWeight.w700)),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                onPressed: _est < 12 ? () => setState(() => _est++) : null,
+                icon: const Icon(Icons.add_circle_outline_rounded),
+              ),
+            ]),
             Expanded(
-              child: s.tasks.isEmpty
+              child: list.isEmpty
                   ? const Center(
                       child: Text('Nothing planned yet ✨\nAdd your first task above.',
                           textAlign: TextAlign.center,
                           style: TextStyle(color: Colors.white38, height: 1.5)))
                   : ListView.separated(
                       padding: const EdgeInsets.only(bottom: 16),
-                      itemCount: s.tasks.length,
+                      itemCount: list.length,
                       separatorBuilder: (_, __) => const SizedBox(height: 10),
-                      itemBuilder: (_, i) => _taskTile(s, s.tasks[i]),
+                      itemBuilder: (_, i) => _taskTile(s, list[i]),
                     ),
             ),
           ]),
@@ -638,8 +1229,7 @@ class _PlanTabState extends State<PlanTab> {
         alignment: Alignment.centerRight,
         padding: const EdgeInsets.only(right: 22),
         decoration: BoxDecoration(
-            color: Colors.redAccent.withAlpha(70),
-            borderRadius: BorderRadius.circular(22)),
+            color: Colors.redAccent.withAlpha(70), borderRadius: BorderRadius.circular(22)),
         child: const Icon(Icons.delete_outline_rounded),
       ),
       child: Glass(
@@ -658,9 +1248,7 @@ class _PlanTabState extends State<PlanTab> {
                 color: t.done ? kMint : Colors.transparent,
                 border: Border.all(color: t.done ? kMint : Colors.white38, width: 2),
               ),
-              child: t.done
-                  ? const Icon(Icons.check_rounded, size: 18, color: kInk)
-                  : null,
+              child: t.done ? const Icon(Icons.check_rounded, size: 18, color: kInk) : null,
             ),
           ),
           const SizedBox(width: 12),
@@ -672,7 +1260,11 @@ class _PlanTabState extends State<PlanTab> {
                   decoration: t.done ? TextDecoration.lineThrough : null,
                 )),
           ),
-          if (t.pomos > 0) Text('🍅×${t.pomos}  ', style: const TextStyle(fontSize: 13)),
+          Text('🍅 ${t.pomos}/${t.est}  ',
+              style: TextStyle(
+                  fontSize: 13,
+                  color: t.pomos >= t.est ? kMint : Colors.white70,
+                  fontWeight: FontWeight.w600)),
           IconButton(
             visualDensity: VisualDensity.compact,
             onPressed: t.done ? null : () => s.setActive(t.id),
@@ -694,13 +1286,13 @@ class MoonTab extends StatelessWidget {
     final c = TextEditingController(text: s.petName);
     final n = await showDialog<String>(
       context: context,
-      builder: (_) => AlertDialog(
+      builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF241F5E),
         title: const Text('Name your moon'),
         content: TextField(controller: c, autofocus: true, maxLength: 14),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(context, c.text), child: const Text('Save')),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, c.text), child: const Text('Save')),
         ],
       ),
     );
@@ -709,16 +1301,11 @@ class MoonTab extends StatelessWidget {
   }
 
   void _feed(BuildContext context, int cost, double amt) {
-    if (!s.feed(cost, amt)) {
-      ScaffoldMessenger.of(context)
-        ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(
-          content: const Text('Not enough stardust — go focus to earn some ✨'),
-          behavior: SnackBarBehavior.floating,
-          backgroundColor: const Color(0xFF2B2670),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-        ));
-    }
+    if (!s.feed(cost, amt)) toast(context, 'Not enough stardust — go focus to earn some ✨');
+  }
+
+  void _shop(BuildContext context, String r) {
+    if (r == 'poor') toast(context, 'Not enough stardust yet ✨');
   }
 
   @override
@@ -726,14 +1313,12 @@ class MoonTab extends StatelessWidget {
     return ListenableBuilder(
       listenable: s,
       builder: (context, _) {
+        final hours = (s.totalMin / 60);
         return SingleChildScrollView(
           padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
           child: Column(children: [
             Align(alignment: Alignment.centerRight, child: Pill('✨', '${s.stardust}')),
-            MoonPet(
-                mood: s.mood == Mood.focus || s.mood == Mood.sleepy ? s.mood : (s.fullness < 0.25 ? Mood.sad : Mood.happy),
-                level: s.level,
-                size: 260),
+            MoonPet(mood: s.mood, level: s.level, skin: s.skin, acc: s.acc, size: 260),
             GestureDetector(
               onTap: () => _rename(context),
               child: Row(mainAxisSize: MainAxisSize.min, children: [
@@ -756,13 +1341,71 @@ class MoonTab extends StatelessWidget {
                 _Bar('Tummy', '${(s.fullness * 100).round()}%', s.fullness, kPink),
               ]),
             ),
-            const SizedBox(height: 14),
+            const SizedBox(height: 12),
             Row(children: [
               Expanded(child: _Feed('🍬', 'Star candy', 5, () => _feed(context, 5, 0.25))),
               const SizedBox(width: 12),
               Expanded(child: _Feed('☁️', 'Cloud milk', 10, () => _feed(context, 10, 0.55))),
             ]),
-            const SizedBox(height: 14),
+            const SizedBox(height: 18),
+            _sectionTitle('This week'),
+            Glass(
+              radius: 24,
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+              child: Column(children: [
+                SizedBox(
+                  height: 110,
+                  width: double.infinity,
+                  child: CustomPaint(painter: WeekPainter(s.last7, DateTime.now())),
+                ),
+                const SizedBox(height: 10),
+                Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
+                  _Stat('🔥', '${s.streak}', 'day streak'),
+                  _Stat('🍅', '${s.totalPomos}', 'sessions'),
+                  _Stat('⏱️', hours >= 10 ? hours.toStringAsFixed(0) : hours.toStringAsFixed(1), 'hours focused'),
+                ]),
+              ]),
+            ),
+            const SizedBox(height: 18),
+            _sectionTitle('Closet'),
+            SizedBox(
+              height: 92,
+              child: ListView(scrollDirection: Axis.horizontal, children: [
+                for (int i = 0; i < skins.length; i++)
+                  _Tile(
+                    leading: Container(
+                      width: 34,
+                      height: 34,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: LinearGradient(
+                            colors: [skins[i].hi, skins[i].lo],
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight),
+                      ),
+                    ),
+                    label: skins[i].name,
+                    price: s.ownedSkins.contains(i) ? null : skins[i].cost,
+                    selected: s.skin == i,
+                    onTap: () => _shop(context, s.pickSkin(i)),
+                  ),
+              ]),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              height: 92,
+              child: ListView(scrollDirection: Axis.horizontal, children: [
+                for (int i = 0; i < accNames.length; i++)
+                  _Tile(
+                    leading: Text(accEmoji[i], style: const TextStyle(fontSize: 26)),
+                    label: accNames[i],
+                    price: s.ownedAcc.contains(i) ? null : accCosts[i],
+                    selected: s.acc == i,
+                    onTap: () => _shop(context, s.pickAcc(i)),
+                  ),
+              ]),
+            ),
+            const SizedBox(height: 16),
             const Text(
               'Finish a focus session → +10 xp, +5 ✨.\nKeep the tummy full or the moon gets sad.',
               textAlign: TextAlign.center,
@@ -771,6 +1414,59 @@ class MoonTab extends StatelessWidget {
           ]),
         );
       },
+    );
+  }
+
+  Widget _sectionTitle(String t) => Align(
+        alignment: Alignment.centerLeft,
+        child: Padding(
+          padding: const EdgeInsets.only(bottom: 8, left: 4),
+          child: Text(t, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+        ),
+      );
+}
+
+class _Stat extends StatelessWidget {
+  const _Stat(this.emoji, this.value, this.label);
+  final String emoji, value, label;
+  @override
+  Widget build(BuildContext context) => Column(children: [
+        Text('$emoji $value', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+        Text(label, style: const TextStyle(fontSize: 12, color: Colors.white54)),
+      ]);
+}
+
+class _Tile extends StatelessWidget {
+  const _Tile({required this.leading, required this.label, required this.price, required this.selected, required this.onTap});
+  final Widget leading;
+  final String label;
+  final int? price;
+  final bool selected;
+  final VoidCallback onTap;
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 10),
+      child: GestureDetector(
+        onTap: onTap,
+        child: SizedBox(
+          width: 84,
+          child: Glass(
+            radius: 20,
+            border: selected ? kGold.withAlpha(200) : null,
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+              SizedBox(height: 34, child: Center(child: leading)),
+              const SizedBox(height: 4),
+              Text(label, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+              Text(
+                selected ? 'wearing' : (price == null ? 'owned' : '$price ✨'),
+                style: TextStyle(fontSize: 11, color: selected ? kGold : (price == null ? Colors.white38 : kPink)),
+              ),
+            ]),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -825,6 +1521,49 @@ class _Feed extends StatelessWidget {
   }
 }
 
+class WeekPainter extends CustomPainter {
+  WeekPainter(this.v, this.today);
+  final List<int> v;
+  final DateTime today;
+  @override
+  void paint(Canvas canvas, Size size) {
+    const labels = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+    final maxV = math.max(4, v.reduce(math.max));
+    final slot = size.width / 7;
+    final chartH = size.height - 20;
+    for (int i = 0; i < 7; i++) {
+      final date = today.subtract(Duration(days: 6 - i));
+      final h = v[i] / maxV * (chartH - 16);
+      final x = slot * i + slot / 2;
+      final isToday = i == 6;
+      final bar = RRect.fromRectAndRadius(
+          Rect.fromLTWH(x - 9, chartH - math.max(h, 4), 18, math.max(h, 4)), const Radius.circular(9));
+      canvas.drawRRect(
+          bar,
+          Paint()
+            ..color = v[i] == 0
+                ? Colors.white.withAlpha(25)
+                : (isToday ? kGold : kLilac));
+      _t(canvas, labels[date.weekday - 1], Offset(x, size.height - 8), 11,
+          isToday ? Colors.white : Colors.white54, FontWeight.w600);
+      if (v[i] > 0) {
+        _t(canvas, '${v[i]}', Offset(x, chartH - h - 10), 11, Colors.white70, FontWeight.w700);
+      }
+    }
+  }
+
+  void _t(Canvas c, String s, Offset center, double size, Color col, FontWeight w) {
+    final tp = TextPainter(
+      text: TextSpan(text: s, style: TextStyle(color: col, fontSize: size, fontWeight: w)),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(c, center - Offset(tp.width / 2, tp.height / 2));
+  }
+
+  @override
+  bool shouldRepaint(WeekPainter o) => true;
+}
+
 // ───────────────────────── small widgets ─────────────────────────
 class Glass extends StatelessWidget {
   const Glass({super.key, required this.child, this.padding, this.radius = 24, this.border});
@@ -839,7 +1578,8 @@ class Glass extends StatelessWidget {
       decoration: BoxDecoration(
         color: Colors.white.withAlpha(20),
         borderRadius: BorderRadius.circular(radius),
-        border: Border.all(color: border ?? Colors.white.withAlpha(30), width: border != null ? 1.5 : 1),
+        border: Border.all(
+            color: border ?? Colors.white.withAlpha(30), width: border != null ? 1.5 : 1),
       ),
       child: child,
     );
@@ -965,8 +1705,8 @@ class RingPainter extends CustomPainter {
             transform: const GradientRotation(-math.pi / 2),
           ).createShader(rect));
     final a = -math.pi / 2 + 2 * math.pi * progress;
-    canvas.drawCircle(c + Offset(math.cos(a), math.sin(a)) * rad, 7,
-        Paint()..color = Colors.white);
+    canvas.drawCircle(
+        c + Offset(math.cos(a), math.sin(a)) * rad, 7, Paint()..color = Colors.white);
   }
 
   @override
@@ -975,10 +1715,19 @@ class RingPainter extends CustomPainter {
 
 // ───────────────────────── the moon pet ─────────────────────────
 class MoonPet extends StatefulWidget {
-  const MoonPet({super.key, required this.mood, required this.level, required this.size});
+  const MoonPet({
+    super.key,
+    required this.mood,
+    required this.level,
+    required this.size,
+    this.skin = 0,
+    this.acc = 0,
+    this.onTap,
+  });
   final Mood mood;
-  final int level;
+  final int level, skin, acc;
   final double size;
+  final VoidCallback? onTap;
   @override
   State<MoonPet> createState() => _MoonPetState();
 }
@@ -1022,6 +1771,7 @@ class _MoonPetState extends State<MoonPet> with TickerProviderStateMixin {
   void _pet() {
     HapticFeedback.lightImpact();
     _pop.forward(from: 0);
+    widget.onTap?.call();
   }
 
   @override
@@ -1044,10 +1794,13 @@ class _MoonPetState extends State<MoonPet> with TickerProviderStateMixin {
                 child: CustomPaint(
                   size: Size(size, size),
                   painter: MoonPainter(
-                      mood: love ? Mood.love : widget.mood,
-                      blink: _blink,
-                      v: _c.value,
-                      level: widget.level),
+                    mood: love ? Mood.love : widget.mood,
+                    blink: _blink,
+                    v: _c.value,
+                    level: widget.level,
+                    skin: widget.skin,
+                    acc: widget.acc,
+                  ),
                 ),
               ),
               if (love)
@@ -1057,7 +1810,7 @@ class _MoonPetState extends State<MoonPet> with TickerProviderStateMixin {
                     top: size * 0.22 - p * size * (0.22 + 0.06 * i),
                     child: Opacity(
                       opacity: (1 - p).clamp(0.0, 1.0),
-                      child: Text('💗', style: TextStyle(fontSize: 16.0 + i * 5)),
+                      child: Text('💗', style: TextStyle(fontSize: size * (0.075 + 0.02 * i))),
                     ),
                   ),
             ]);
@@ -1069,11 +1822,18 @@ class _MoonPetState extends State<MoonPet> with TickerProviderStateMixin {
 }
 
 class MoonPainter extends CustomPainter {
-  MoonPainter({required this.mood, required this.blink, required this.v, required this.level});
+  MoonPainter({
+    required this.mood,
+    required this.blink,
+    required this.v,
+    required this.level,
+    this.skin = 0,
+    this.acc = 0,
+  });
   final Mood mood;
   final bool blink;
   final double v; // 0..1 over 12s
-  final int level;
+  final int level, skin, acc;
 
   Path _star(Offset c, double R) {
     final p = Path();
@@ -1099,8 +1859,91 @@ class MoonPainter extends CustomPainter {
     tp.paint(canvas, o);
   }
 
+  void _accessory(Canvas canvas, Offset c, double r, double ey, double ex) {
+    switch (acc) {
+      case 1: // bow
+        canvas.save();
+        canvas.translate(c.dx - r * 0.56, c.dy - r * 0.8);
+        canvas.rotate(-0.5);
+        final wing = Paint()..color = const Color(0xFFFF7FAE);
+        final l = Path()
+          ..moveTo(0, 0)
+          ..lineTo(-r * 0.3, -r * 0.17)
+          ..lineTo(-r * 0.3, r * 0.17)
+          ..close();
+        final rr = Path()
+          ..moveTo(0, 0)
+          ..lineTo(r * 0.3, -r * 0.17)
+          ..lineTo(r * 0.3, r * 0.17)
+          ..close();
+        canvas.drawPath(l, wing);
+        canvas.drawPath(rr, wing);
+        canvas.drawCircle(Offset.zero, r * 0.075, Paint()..color = const Color(0xFFFFB3CF));
+        canvas.restore();
+        break;
+      case 2: // nightcap
+        final a1 = -150 * math.pi / 180, a2 = -30 * math.pi / 180;
+        final p1 = c + Offset(math.cos(a1), math.sin(a1)) * r;
+        final p2 = c + Offset(math.cos(a2), math.sin(a2)) * r;
+        final tip = c + Offset(r * 0.42, -r * 1.42);
+        final cap = Path()
+          ..moveTo(p1.dx, p1.dy)
+          ..quadraticBezierTo(c.dx - r * 0.7, c.dy - r * 1.35, tip.dx, tip.dy)
+          ..quadraticBezierTo(c.dx + r * 0.6, c.dy - r * 0.95, p2.dx, p2.dy)
+          ..close();
+        canvas.drawPath(cap, Paint()..color = const Color(0xFF7C6BE0));
+        canvas.drawArc(Rect.fromCircle(center: c, radius: r * 1.0), a1, a2 - a1, false,
+            Paint()
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = r * 0.14
+              ..strokeCap = StrokeCap.round
+              ..color = Colors.white);
+        canvas.drawCircle(tip, r * 0.1, Paint()..color = Colors.white);
+        break;
+      case 3: // glasses
+        final rim = Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = r * 0.04
+          ..color = kInk;
+        final lens = Paint()..color = Colors.white.withAlpha(45);
+        for (final sx in const [-1.0, 1.0]) {
+          final e = Offset(c.dx + sx * ex, ey);
+          canvas.drawCircle(e, r * 0.21, lens);
+          canvas.drawCircle(e, r * 0.21, rim);
+        }
+        canvas.drawLine(Offset(c.dx - ex + r * 0.21, ey), Offset(c.dx + ex - r * 0.21, ey), rim);
+        break;
+      case 4: // crown
+        final b = c.dy - r * 0.9;
+        final x = c.dx;
+        final crown = Path()
+          ..moveTo(x - r * 0.4, b)
+          ..lineTo(x - r * 0.4, b - r * 0.42)
+          ..lineTo(x - r * 0.2, b - r * 0.22)
+          ..lineTo(x, b - r * 0.5)
+          ..lineTo(x + r * 0.2, b - r * 0.22)
+          ..lineTo(x + r * 0.4, b - r * 0.42)
+          ..lineTo(x + r * 0.4, b)
+          ..close();
+        canvas.drawPath(crown, Paint()..color = const Color(0xFFFFC93C));
+        canvas.drawPath(
+            crown,
+            Paint()
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = r * 0.03
+              ..strokeJoin = StrokeJoin.round
+              ..color = const Color(0xFFE0A030));
+        for (final dx in const [-0.4, 0.0, 0.4]) {
+          canvas.drawCircle(Offset(x + dx * r, b - r * (dx == 0 ? 0.5 : 0.42)), r * 0.05,
+              Paint()..color = const Color(0xFFFF6B8B));
+        }
+        break;
+    }
+  }
+
   @override
   void paint(Canvas canvas, Size s) {
+    final sk = skins[skin.clamp(0, skins.length - 1)];
     final h = math.sin(v * 2 * math.pi * 4); // hover, 3s period
     final r = s.width * 0.32;
     final c = Offset(s.width / 2, s.height * 0.46 + h * s.height * 0.022);
@@ -1121,8 +1964,7 @@ class MoonPainter extends CustomPainter {
       c,
       r * 1.9,
       Paint()
-        ..shader = const RadialGradient(
-                colors: [Color(0x55FFE9A8), Color(0x00FFE9A8)])
+        ..shader = RadialGradient(colors: [sk.mid.withAlpha(85), sk.mid.withAlpha(0)])
             .createShader(Rect.fromCircle(center: c, radius: r * 1.9)),
     );
 
@@ -1140,16 +1982,16 @@ class MoonPainter extends CustomPainter {
       c,
       r,
       Paint()
-        ..shader = const RadialGradient(
-          center: Alignment(-0.4, -0.5),
+        ..shader = RadialGradient(
+          center: const Alignment(-0.4, -0.5),
           radius: 1.1,
-          colors: [Color(0xFFFFF8DC), Color(0xFFFFE08A), Color(0xFFF5C25B)],
-          stops: [0.0, 0.55, 1.0],
+          colors: [sk.hi, sk.mid, sk.lo],
+          stops: const [0.0, 0.55, 1.0],
         ).createShader(body),
     );
 
     // craters
-    final cr = Paint()..color = const Color(0x22B8860B);
+    final cr = Paint()..color = sk.lo.withAlpha(55);
     for (final k in const [
       [-0.5, -0.62, 0.15],
       [0.58, -0.55, 0.1],
@@ -1175,18 +2017,19 @@ class MoonPainter extends CustomPainter {
     for (final sx in const [-1.0, 1.0]) {
       final e = Offset(c.dx + sx * ex, ey);
       if (closedHat) {
-        canvas.drawArc(Rect.fromCenter(center: e + Offset(0, r * 0.03), width: r * 0.2, height: r * 0.14),
+        canvas.drawArc(
+            Rect.fromCenter(center: e + Offset(0, r * 0.03), width: r * 0.2, height: r * 0.14),
             math.pi, math.pi, false, stroke);
       } else if (closedU) {
-        canvas.drawArc(Rect.fromCenter(center: e - Offset(0, r * 0.03), width: r * 0.2, height: r * 0.14),
+        canvas.drawArc(
+            Rect.fromCenter(center: e - Offset(0, r * 0.03), width: r * 0.2, height: r * 0.14),
             0, math.pi, false, stroke);
       } else {
         canvas.drawOval(Rect.fromCenter(center: e, width: r * 0.17, height: r * 0.25), ink);
         canvas.drawCircle(e + Offset(-r * 0.03, -r * 0.06), r * 0.035, Paint()..color = Colors.white);
       }
-      // brows
       if (!closedU && !closedHat && (mood == Mood.focus || mood == Mood.sad)) {
-        final inner = mood == Mood.focus ? 0.13 : 0.2; // inner end height
+        final inner = mood == Mood.focus ? 0.13 : 0.2;
         final outer = mood == Mood.focus ? 0.2 : 0.13;
         canvas.drawLine(
           Offset(e.dx - sx * r * 0.11, ey - r * outer),
@@ -1200,7 +2043,8 @@ class MoonPainter extends CustomPainter {
     final cheek = Paint()..color = kPink.withAlpha(mood == Mood.love ? 170 : 110);
     for (final sx in const [-1.0, 1.0]) {
       canvas.drawOval(
-          Rect.fromCenter(center: Offset(c.dx + sx * r * 0.63, ey + r * 0.2), width: r * 0.22, height: r * 0.13),
+          Rect.fromCenter(
+              center: Offset(c.dx + sx * r * 0.63, ey + r * 0.2), width: r * 0.22, height: r * 0.13),
           cheek);
     }
 
@@ -1212,7 +2056,8 @@ class MoonPainter extends CustomPainter {
             Paint()..color = const Color(0xFFC2476B));
         break;
       case Mood.sleepy:
-        canvas.drawOval(Rect.fromCenter(center: m + Offset(0, r * 0.03), width: r * 0.09, height: r * 0.11),
+        canvas.drawOval(
+            Rect.fromCenter(center: m + Offset(0, r * 0.03), width: r * 0.09, height: r * 0.11),
             Paint()..color = kInk.withAlpha(200));
         break;
       case Mood.sad:
@@ -1227,6 +2072,8 @@ class MoonPainter extends CustomPainter {
         break;
     }
 
+    _accessory(canvas, c, r, ey, ex);
+
     // floating zzz when sleepy
     if (mood == Mood.sleepy) {
       for (int i = 0; i < 2; i++) {
@@ -1239,4 +2086,82 @@ class MoonPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(MoonPainter o) => true;
+}
+
+// ───────────────────────── floating bubble (runs in its own engine) ─────────────────────────
+class OverlayBubble extends StatefulWidget {
+  const OverlayBubble({super.key});
+  @override
+  State<OverlayBubble> createState() => _OverlayBubbleState();
+}
+
+class _OverlayBubbleState extends State<OverlayBubble> {
+  Mood _mood = Mood.happy;
+  int _left = 0, _level = 1, _skin = 0, _acc = 0, _phase = 0;
+  bool _running = false;
+  StreamSubscription<dynamic>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    try {
+      _sub = FlutterOverlayWindow.overlayListener.listen((dynamic e) {
+        if (e is! Map || !mounted) return;
+        setState(() {
+          _mood = Mood.values[((e['mood'] as num?)?.toInt() ?? 0).clamp(0, 4)];
+          _left = (e['left'] as num?)?.toInt() ?? 0;
+          _level = (e['level'] as num?)?.toInt() ?? 1;
+          _skin = (e['skin'] as num?)?.toInt() ?? 0;
+          _acc = (e['acc'] as num?)?.toInt() ?? 0;
+          _phase = (e['phase'] as num?)?.toInt() ?? 0;
+          _running = e['running'] as bool? ?? false;
+        });
+      });
+    } catch (_) {}
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  String get _time =>
+      '${(_left ~/ 60).toString().padLeft(2, '0')}:${(_left % 60).toString().padLeft(2, '0')}';
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+      MoonPet(mood: _mood, level: _level, skin: _skin, acc: _acc, size: 128),
+      GestureDetector(
+        onTap: () {
+          HapticFeedback.selectionClick();
+          () async {
+            try {
+              await FlutterOverlayWindow.shareData('toggle');
+            } catch (_) {}
+          }();
+        },
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: const Color(0xE61C1B4B),
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: (_phase == 0 ? kGold : kMint).withAlpha(140), width: 1.5),
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(_running ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                size: 16, color: _phase == 0 ? kGold : kMint),
+            const SizedBox(width: 4),
+            Text(_time,
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    fontFeatures: [FontFeature.tabularFigures()])),
+          ]),
+        ),
+      ),
+    ]);
+  }
 }

@@ -18,10 +18,19 @@ jobs:
         run: |
           cp lib/main.dart "$RUNNER_TEMP/main.dart"
           cp pubspec.yaml "$RUNNER_TEMP/pubspec.yaml"
-          flutter create --platforms=android --project-name moonpomo .
+          flutter create --platforms=android --org com.moonpomo --project-name moonpomo .
           cp "$RUNNER_TEMP/main.dart" lib/main.dart
           cp "$RUNNER_TEMP/pubspec.yaml" pubspec.yaml
+      - name: Patch Android manifest + gradle
+        run: python3 ci/patch_android.py
+      - name: Use fixed signing key (so updates install over old versions)
+        run: |
+          mkdir -p ~/.android
+          cp ci/debug.keystore ~/.android/debug.keystore
       - run: flutter pub get
+      - name: App icon
+        continue-on-error: true
+        run: dart run flutter_launcher_icons
       - run: flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:
